@@ -40,7 +40,7 @@ export default {
       }
 
       if (path === "/v1/setup" || path === "/anthropic/setup" || path === "/anthropic/v1/setup") {
-        return textResponse(agentSetup(request), "text/plain; charset=utf-8");
+        return textResponse(agentSetup(request, env), "text/plain; charset=utf-8");
       }
 
       if (path === "/v1/messages" || (path === "/v1/models" && looksLikeAnthropicRequest(request)) || path.startsWith("/anthropic/")) {
@@ -292,7 +292,7 @@ async function handleAnthropic(request, env, path) {
   }
 
   if (anthPath === "/v1/setup" || anthPath === "/setup") {
-    return textResponse(agentSetup(request), "text/plain; charset=utf-8");
+    return textResponse(agentSetup(request, env), "text/plain; charset=utf-8");
   }
 
   return errorResponse(404, "not_found", `Unsupported Anthropic-compatible route ${path}`);
@@ -322,10 +322,11 @@ async function anthropicDirectCapability(request, env, body, route) {
 }
 
 async function upstreamAnthropicMessages(request, env, body) {
+  const payload = normalizeAnthropicRequestBody(body, env);
   const response = await fetch(new URL("/v1/messages", upstreamBase(env)), {
     method: "POST",
-    headers: anthropicUpstreamHeaders(request, env, Boolean(body.stream)),
-    body: JSON.stringify(body || {}),
+    headers: anthropicUpstreamHeaders(request, env, Boolean(payload.stream)),
+    body: JSON.stringify(payload),
   });
 
   if (!response.ok) {
@@ -1157,6 +1158,12 @@ function envDefaultClaudeModelSafe() {
   return DEFAULT_CLAUDE_MODEL;
 }
 
+function normalizeAnthropicRequestBody(body, env) {
+  const payload = { ...(body || {}) };
+  payload.model = toUpstreamAnthropicModel(payload.model || (env && env.DEFAULT_CLAUDE_MODEL) || DEFAULT_CLAUDE_MODEL);
+  return payload;
+}
+
 async function proxyUpstream(request, env, path) {
   const upstreamUrl = new URL(path + new URL(request.url).search, upstreamBase(env));
   const headers = new Headers(request.headers);
@@ -1712,6 +1719,13 @@ function toAnthropicModel(model) {
 }
 
 function anthropicVersionedId(id) {
+  if (/^claude-opus-4-8$/i.test(id)) return "claude-opus-4-8-20260501";
+  if (/^claude-opus-4-7$/i.test(id)) return "claude-opus-4-7-20260101";
+  if (/^claude-opus-4-6$/i.test(id)) return "claude-opus-4-6-20251201";
+  if (/^claude-opus-4-5$/i.test(id)) return "claude-opus-4-5-20251101";
+  if (/^claude-opus-4-1$/i.test(id)) return "claude-opus-4-1-20250805";
+  if (/^claude-sonnet-4-6$/i.test(id)) return "claude-sonnet-4-6-20260101";
+  if (/^claude-sonnet-4$/i.test(id)) return "claude-sonnet-4-20250514";
   if (/^claude-/i.test(id)) return `${id}-20260101`;
   return id;
 }
@@ -1819,29 +1833,30 @@ function serviceInfo(request, env) {
   };
 }
 
-function agentSetup(request) {
+function agentSetup(request, env) {
   const origin = new URL(request.url).origin;
+  const claudeModel = toUpstreamAnthropicModel(env && env.DEFAULT_CLAUDE_MODEL ? env.DEFAULT_CLAUDE_MODEL : DEFAULT_CLAUDE_MODEL);
   return `Claude Code / Anthropic-compatible setup
 
 PowerShell:
 $env:ANTHROPIC_BASE_URL = "${origin}"
 $env:ANTHROPIC_AUTH_TOKEN = "<your unlimited.surf key>"
 $env:ANTHROPIC_API_KEY = "<your unlimited.surf key>"
-$env:ANTHROPIC_MODEL = "${DEFAULT_CLAUDE_MODEL}"
+$env:ANTHROPIC_MODEL = "${claudeModel}"
 claude
 
 Bash:
 export ANTHROPIC_BASE_URL="${origin}"
 export ANTHROPIC_AUTH_TOKEN="<your unlimited.surf key>"
 export ANTHROPIC_API_KEY="<your unlimited.surf key>"
-export ANTHROPIC_MODEL="${DEFAULT_CLAUDE_MODEL}"
+export ANTHROPIC_MODEL="${claudeModel}"
 claude
 
 Goose / Hermes / other agents:
 Provider: Anthropic-compatible
 Base URL: ${origin}
 API key: <your unlimited.surf key>
-Model: ${DEFAULT_CLAUDE_MODEL}
+Model: ${claudeModel}
 
 Messages endpoint: POST ${origin}/v1/messages
 Models endpoint: GET ${origin}/v1/models
