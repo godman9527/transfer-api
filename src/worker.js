@@ -1,12 +1,13 @@
 const DEFAULT_UPSTREAM_BASE_URL = "https://unlimited.surf";
 const DEFAULT_OPENAI_MODEL = "gateway-gpt-5-5";
-const DEFAULT_CLAUDE_MODEL = "claude-opus-4-7-20260101";
+const DEFAULT_CLAUDE_MODEL = "claude-opus-4-8-20260501";
+const DEFAULT_ANTHROPIC_VERSION = "2024-10-22";
 const TOOL_CALL_SENTINEL = "__TRANSFER_API_TOOL_CALLS__";
 
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET,POST,PUT,PATCH,DELETE,OPTIONS",
-  "Access-Control-Allow-Headers": "authorization,content-type,x-api-key,anthropic-api-key,anthropic-version,anthropic-beta,openai-beta",
+  "Access-Control-Allow-Headers": "authorization,content-type,x-api-key,anthropic-api-key,anthropic-version,anthropic-beta,anthropic-dangerous-direct-browser-access,openai-beta,x-request-id",
   "Access-Control-Expose-Headers": "content-type,request-id,x-request-id",
 };
 
@@ -165,7 +166,7 @@ async function openAIChatCompletions(request, env, body) {
 
   if (toolContext.enabled) {
     const bridge = await openAIChatViaAnthropic(request, env, body, toolContext);
-    if (body.stream) return sseResponse(streamOpenAIChatBridge(bridge, { id, created, model }));
+    if (body.stream) return sseResponse(streamOpenAIChatFromAnthropicStream(bridge, { id, created, model }));
     return jsonResponse(openAIChatBridgeResponse(bridge, { id, created, model }));
   }
 
@@ -224,7 +225,7 @@ async function openAIResponses(request, env, body) {
 
   if (toolContext.enabled) {
     const bridge = await openAIResponsesViaAnthropic(request, env, body, toolContext);
-    if (body.stream) return sseResponse(streamOpenAIResponsesBridge(bridge, { id, created, model }));
+    if (body.stream) return sseResponse(streamOpenAIResponsesFromAnthropicStream(bridge, body, { id, created, model }));
     return jsonResponse(openAIResponsesBridgeResponse(body, bridge, { id, created, model }));
   }
 
@@ -409,7 +410,7 @@ async function anthropicModels(request, env) {
     .map((model) => toAnthropicModel(model));
 
   return jsonResponse({
-    data: claudeModels.length ? claudeModels : [toAnthropicModel({ id: DEFAULT_CLAUDE_MODEL, name: "Claude Opus 4.7" })],
+    data: claudeModels.length ? claudeModels : [toAnthropicModel({ id: DEFAULT_CLAUDE_MODEL, name: "Claude Opus 4.8" })],
     has_more: false,
     first_id: claudeModels[0] ? claudeModels[0].id : DEFAULT_CLAUDE_MODEL,
     last_id: claudeModels[claudeModels.length - 1] ? claudeModels[claudeModels.length - 1].id : DEFAULT_CLAUDE_MODEL,
@@ -753,8 +754,8 @@ function openAIResponseEnvelope(body, data) {
 async function openAIChatViaAnthropic(request, env, body, toolContext) {
   const anthropicBody = {
     model: toUpstreamAnthropicModel(body.model || env.DEFAULT_CLAUDE_MODEL || DEFAULT_CLAUDE_MODEL),
-    max_tokens: body.max_tokens || body.max_completion_tokens || 4096,
-    stream: false,
+    max_tokens: body.max_tokens || body.max_completion_tokens || 16384,
+    stream: Boolean(body.stream),
     system: collectOpenAISystemMessages(body.messages),
     messages: openAIChatMessagesToAnthropic(body.messages),
     tools: toolContext.tools.map(toAnthropicToolDefinition),
@@ -762,14 +763,24 @@ async function openAIChatViaAnthropic(request, env, body, toolContext) {
   };
   if (body.temperature != null) anthropicBody.temperature = body.temperature;
   if (body.top_p != null) anthropicBody.top_p = body.top_p;
+  const thinking = resolveThinking(body);
+  if (thinking) {
+    anthropicBody.thinking = thinking;
+    if (thinking.budget_tokens) {
+      anthropicBody.max_tokens = Math.max(anthropicBody.max_tokens, thinking.budget_tokens + 4096);
+    }
+  }
+  if (body.stream) {
+    return callAnthropicMessagesStream(request, env, anthropicBody);
+  }
   return callAnthropicMessagesJson(request, env, anthropicBody);
 }
 
 async function openAIResponsesViaAnthropic(request, env, body, toolContext) {
   const anthropicBody = {
     model: toUpstreamAnthropicModel(body.model || env.DEFAULT_CLAUDE_MODEL || DEFAULT_CLAUDE_MODEL),
-    max_tokens: body.max_output_tokens || body.max_tokens || 4096,
-    stream: false,
+    max_tokens: body.max_output_tokens || body.max_tokens || 16384,
+    stream: Boolean(body.stream),
     system: body.instructions || "",
     messages: openAIResponseInputToAnthropic(body.input),
     tools: toolContext.tools.map(toAnthropicToolDefinition),
@@ -777,6 +788,16 @@ async function openAIResponsesViaAnthropic(request, env, body, toolContext) {
   };
   if (body.temperature != null) anthropicBody.temperature = body.temperature;
   if (body.top_p != null) anthropicBody.top_p = body.top_p;
+  const thinking = resolveThinking(body);
+  if (thinking) {
+    anthropicBody.thinking = thinking;
+    if (thinking.budget_tokens) {
+      anthropicBody.max_tokens = Math.max(anthropicBody.max_tokens, thinking.budget_tokens + 4096);
+    }
+  }
+  if (body.stream) {
+    return callAnthropicMessagesStream(request, env, anthropicBody);
+  }
   return callAnthropicMessagesJson(request, env, anthropicBody);
 }
 
@@ -784,7 +805,7 @@ async function callAnthropicMessagesJson(request, env, body) {
   const response = await fetch(new URL("/v1/messages", upstreamBase(env)), {
     method: "POST",
     headers: anthropicUpstreamHeaders(request, env, false),
-    body: JSON.stringify(body || {}),
+    body: JSON.stringify({ ...(body || {}), stream: false }),
   });
 
   if (!response.ok) {
@@ -793,6 +814,21 @@ async function callAnthropicMessagesJson(request, env, body) {
   }
 
   return response.json();
+}
+
+async function callAnthropicMessagesStream(request, env, body) {
+  const response = await fetch(new URL("/v1/messages", upstreamBase(env)), {
+    method: "POST",
+    headers: anthropicUpstreamHeaders(request, env, true),
+    body: JSON.stringify({ ...(body || {}), stream: true }),
+  });
+
+  if (!response.ok) {
+    const detail = await response.text();
+    throw new UpstreamError(response.status, detail || response.statusText);
+  }
+
+  return response;
 }
 
 function openAIChatBridgeResponse(anthropic, meta) {
@@ -931,6 +967,233 @@ function streamOpenAIResponsesBridge(anthropic, meta) {
         type: "response.completed",
         response: { id: meta.id, object: "response", created_at: meta.created, status: "completed", model: meta.model },
       });
+      writeRawSse(controller, "data: [DONE]\n\n");
+      controller.close();
+    },
+  });
+}
+
+function streamOpenAIChatFromAnthropicStream(upstreamResponse, meta) {
+  const decoder = new TextDecoder();
+  return new ReadableStream({
+    async start(controller) {
+      writeSse(controller, {
+        id: meta.id,
+        object: "chat.completion.chunk",
+        created: meta.created,
+        model: meta.model,
+        choices: [{ index: 0, delta: { role: "assistant", content: "" }, finish_reason: null }],
+      });
+
+      const toolCalls = [];
+      let currentToolIndex = -1;
+      let buffer = "";
+
+      try {
+        const reader = upstreamResponse.body.getReader();
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split(/\r?\n/);
+          buffer = lines.pop() || "";
+
+          for (const line of lines) {
+            if (!line.startsWith("data:")) continue;
+            const raw = line.slice(5).trim();
+            if (!raw || raw === "[DONE]") continue;
+            const event = parseSseJson(raw);
+            if (!event) continue;
+
+            if (event.type === "content_block_start" && event.content_block) {
+              if (event.content_block.type === "tool_use") {
+                currentToolIndex++;
+                toolCalls.push({ index: currentToolIndex, id: event.content_block.id, name: event.content_block.name, arguments: "" });
+                writeSse(controller, {
+                  id: meta.id,
+                  object: "chat.completion.chunk",
+                  created: meta.created,
+                  model: meta.model,
+                  choices: [{ index: 0, delta: { tool_calls: [{ index: currentToolIndex, id: event.content_block.id, type: "function", function: { name: event.content_block.name, arguments: "" } }] }, finish_reason: null }],
+                });
+              }
+            }
+
+            if (event.type === "content_block_delta" && event.delta) {
+              if (event.delta.type === "text_delta" && event.delta.text) {
+                writeSse(controller, {
+                  id: meta.id,
+                  object: "chat.completion.chunk",
+                  created: meta.created,
+                  model: meta.model,
+                  choices: [{ index: 0, delta: { content: event.delta.text }, finish_reason: null }],
+                });
+              }
+              if (event.delta.type === "input_json_delta" && event.delta.partial_json != null) {
+                const tc = toolCalls[currentToolIndex];
+                if (tc) tc.arguments += event.delta.partial_json;
+                writeSse(controller, {
+                  id: meta.id,
+                  object: "chat.completion.chunk",
+                  created: meta.created,
+                  model: meta.model,
+                  choices: [{ index: 0, delta: { tool_calls: [{ index: currentToolIndex, function: { arguments: event.delta.partial_json } }] }, finish_reason: null }],
+                });
+              }
+            }
+
+            if (event.type === "message_delta" && event.delta) {
+              const reason = event.delta.stop_reason === "tool_use" ? "tool_calls" : openAIStopReason(event.delta.stop_reason);
+              writeSse(controller, {
+                id: meta.id,
+                object: "chat.completion.chunk",
+                created: meta.created,
+                model: meta.model,
+                choices: [{ index: 0, delta: {}, finish_reason: reason }],
+              });
+            }
+          }
+        }
+      } catch (err) {
+        writeSse(controller, {
+          id: meta.id,
+          object: "chat.completion.chunk",
+          created: meta.created,
+          model: meta.model,
+          choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+        });
+      }
+
+      writeRawSse(controller, "data: [DONE]\n\n");
+      controller.close();
+    },
+  });
+}
+
+function streamOpenAIResponsesFromAnthropicStream(upstreamResponse, body, meta) {
+  const decoder = new TextDecoder();
+  return new ReadableStream({
+    async start(controller) {
+      const outputId = `msg_${randomId()}`;
+      writeSseEvent(controller, "response.created", {
+        type: "response.created",
+        response: { id: meta.id, object: "response", created_at: meta.created, status: "in_progress", model: meta.model, output: [] },
+      });
+
+      let outputIndex = 0;
+      let hasText = false;
+      let buffer = "";
+
+      try {
+        const reader = upstreamResponse.body.getReader();
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split(/\r?\n/);
+          buffer = lines.pop() || "";
+
+          for (const line of lines) {
+            if (!line.startsWith("data:")) continue;
+            const raw = line.slice(5).trim();
+            if (!raw || raw === "[DONE]") continue;
+            const event = parseSseJson(raw);
+            if (!event) continue;
+
+            if (event.type === "content_block_start" && event.content_block) {
+              if (event.content_block.type === "tool_use") {
+                const item = {
+                  id: `fc_${randomId()}`,
+                  type: "function_call",
+                  status: "in_progress",
+                  call_id: event.content_block.id,
+                  name: event.content_block.name,
+                  arguments: "",
+                };
+                writeSseEvent(controller, "response.output_item.added", { type: "response.output_item.added", output_index: outputIndex, item });
+                outputIndex++;
+              } else if (event.content_block.type === "text") {
+                if (!hasText) {
+                  hasText = true;
+                  writeSseEvent(controller, "response.output_item.added", {
+                    type: "response.output_item.added",
+                    output_index: outputIndex,
+                    item: { id: outputId, type: "message", status: "in_progress", role: "assistant", content: [] },
+                  });
+                  writeSseEvent(controller, "response.content_part.added", {
+                    type: "response.content_part.added",
+                    item_id: outputId,
+                    output_index: outputIndex,
+                    content_index: 0,
+                    part: { type: "output_text", text: "", annotations: [] },
+                  });
+                }
+              }
+            }
+
+            if (event.type === "content_block_delta" && event.delta) {
+              if (event.delta.type === "text_delta" && event.delta.text) {
+                writeSseEvent(controller, "response.output_text.delta", {
+                  type: "response.output_text.delta",
+                  item_id: outputId,
+                  output_index: hasText ? outputIndex : 0,
+                  content_index: 0,
+                  delta: event.delta.text,
+                });
+              }
+              if (event.delta.type === "input_json_delta" && event.delta.partial_json != null) {
+                writeSseEvent(controller, "response.function_call_arguments.delta", {
+                  type: "response.function_call_arguments.delta",
+                  output_index: outputIndex - 1,
+                  delta: event.delta.partial_json,
+                });
+              }
+            }
+
+            if (event.type === "content_block_stop") {
+              if (outputIndex > 0 && !hasText) {
+                writeSseEvent(controller, "response.function_call_arguments.done", {
+                  type: "response.function_call_arguments.done",
+                  output_index: outputIndex - 1,
+                  arguments: "",
+                });
+                writeSseEvent(controller, "response.output_item.done", {
+                  type: "response.output_item.done",
+                  output_index: outputIndex - 1,
+                  item: { type: "function_call", status: "completed" },
+                });
+              }
+            }
+
+            if (event.type === "message_delta" && event.delta && event.delta.stop_reason) {
+              if (hasText) {
+                writeSseEvent(controller, "response.output_text.done", {
+                  type: "response.output_text.done",
+                  item_id: outputId,
+                  output_index: outputIndex,
+                  content_index: 0,
+                  text: "",
+                });
+                writeSseEvent(controller, "response.output_item.done", {
+                  type: "response.output_item.done",
+                  output_index: outputIndex,
+                  item: { id: outputId, type: "message", status: "completed", role: "assistant", content: [] },
+                });
+              }
+              writeSseEvent(controller, "response.completed", {
+                type: "response.completed",
+                response: { id: meta.id, object: "response", created_at: meta.created, status: "completed", model: meta.model },
+              });
+            }
+          }
+        }
+      } catch (err) {
+        writeSseEvent(controller, "response.completed", {
+          type: "response.completed",
+          response: { id: meta.id, object: "response", created_at: meta.created, status: "completed", model: meta.model },
+        });
+      }
+
       writeRawSse(controller, "data: [DONE]\n\n");
       controller.close();
     },
@@ -1162,6 +1425,7 @@ function toUpstreamAnthropicModel(model) {
   if (raw.startsWith("gateway-claude-sonnet-4-6")) return "claude-sonnet-4-6-20260101";
   if (raw.startsWith("gateway-claude-sonnet-4")) return "claude-sonnet-4-20250514";
   if (/^claude-/i.test(raw)) return anthropicVersionedId(raw);
+  if (/^gpt-|^gateway-gpt-|^o[34]/i.test(raw)) return envDefaultClaudeModelSafe();
   return envDefaultClaudeModelSafe();
 }
 
@@ -1573,7 +1837,7 @@ function anthropicUpstreamHeaders(request, env, wantsStream) {
   headers.set("x-api-key", key);
   headers.set("anthropic-api-key", key);
   headers.set("Authorization", `Bearer ${key}`);
-  headers.set("anthropic-version", request.headers.get("anthropic-version") || "2023-06-01");
+  headers.set("anthropic-version", request.headers.get("anthropic-version") || DEFAULT_ANTHROPIC_VERSION);
   const beta = request.headers.get("anthropic-beta");
   if (beta) headers.set("anthropic-beta", beta);
   if (wantsStream) headers.set("Accept", "text/event-stream");
@@ -1744,11 +2008,26 @@ function reasoningEffort(body) {
   return "medium";
 }
 
+function resolveThinking(body) {
+  if (body.thinking) return body.thinking;
+  if (body.reasoning && body.reasoning.type === "enabled") {
+    return { type: "enabled", budget_tokens: body.reasoning.budget_tokens || 10000 };
+  }
+  const effort = body.reasoning_effort || (body.reasoning && body.reasoning.effort);
+  if (effort === "high" || effort === "max") {
+    return { type: "enabled", budget_tokens: effort === "max" ? 32000 : 16000 };
+  }
+  return null;
+}
+
 function mapUpstreamModel(model) {
   if (!model) return DEFAULT_OPENAI_MODEL;
   if (model.startsWith("gateway-")) return model;
   if (/^claude-/i.test(model)) return `gateway-${model.replace(/-\d{8}$/, "")}`;
-  if (/^gpt-/i.test(model)) return `gateway-${model}`;
+  if (/^gpt-/i.test(model)) {
+    const normalized = model.replace(/\./g, "-");
+    return `gateway-${normalized}`;
+  }
   if (/^gemini-/i.test(model)) return `gateway-google-${model.replace(/^gemini-/i, "")}`;
   return model;
 }
@@ -1785,11 +2064,14 @@ function providerFromModel(model) {
 
 function fallbackModels() {
   return [
+    { id: "gateway-gpt-5-5", name: "GPT-5.5", provider: "openai", tier: "flagship" },
     { id: "gateway-gpt-5", name: "GPT-5", provider: "openai", tier: "flagship" },
     { id: "gateway-gpt-5-1", name: "GPT-5.1", provider: "openai", tier: "flagship" },
+    { id: "gateway-claude-opus-4-8", name: "Claude Opus 4.8", provider: "anthropic", tier: "flagship" },
     { id: "gateway-claude-opus-4-7", name: "Claude Opus 4.7", provider: "anthropic", tier: "flagship" },
+    { id: "gateway-claude-sonnet-4-6", name: "Claude Sonnet 4.6", provider: "anthropic", tier: "standard" },
     { id: "gateway-google-2.5-pro", name: "Gemini 2.5 Pro", provider: "google", tier: "flagship" },
-    { id: "gateway-gemini-3-flash", name: "Gemini 3 Flash", provider: "google", tier: "fast" },
+    { id: "gateway-gemini-3-pro", name: "Gemini 3 Pro", provider: "google", tier: "flagship" },
   ];
 }
 
