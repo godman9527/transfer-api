@@ -20,7 +20,7 @@ export default {
     const path = normalizePath(url.pathname);
 
     try {
-      const authError = validateWorkerApiKey(request, env);
+      const authError = shouldRequireWorkerApiKey(path, request) ? validateWorkerApiKey(request, env) : null;
       if (authError) return authError;
 
       if (path === "/" || path === "/health") {
@@ -1616,6 +1616,16 @@ function validateWorkerApiKey(request, env) {
   }, { status: 401, headers: { "WWW-Authenticate": "Bearer" } });
 }
 
+function shouldRequireWorkerApiKey(path, request) {
+  if (request.method === "OPTIONS") return false;
+  if (path === "/" || path === "/health") return false;
+  if (path === "/v1/models" || path === "/anthropic/v1/models" || path === "/anthropic/models") return false;
+  if (path === "/v1/setup" || path === "/anthropic/setup" || path === "/anthropic/v1/setup") return false;
+  if (path === "/mcp" || path === "/v1/mcp" || path === "/anthropic/mcp" || path === "/anthropic/v1/mcp") return false;
+  if (path === "/codex" || path === "/v1/codex" || path === "/anthropic/codex" || path === "/anthropic/v1/codex") return false;
+  return true;
+}
+
 function clientApiKey(request) {
   const auth = request.headers.get("authorization") || "";
   if (/^bearer\s+/i.test(auth)) return auth.replace(/^bearer\s+/i, "").trim();
@@ -1848,6 +1858,12 @@ function serviceInfo(request, env) {
     ok: true,
     service: "unlimited.surf OpenAI/Anthropic compatibility Worker",
     upstream: stripTrailingSlash(env.UPSTREAM_BASE_URL || DEFAULT_UPSTREAM_BASE_URL),
+    config: {
+      worker_api_key_required: Boolean(env.WORKER_API_KEY),
+      upstream_api_key_configured: Boolean(env.UNLIMITED_SURF_API_KEY || env.API_KEY || env.AUTH_KEY),
+      default_model: env.DEFAULT_MODEL || DEFAULT_OPENAI_MODEL,
+      default_claude_model: toUpstreamAnthropicModel(env.DEFAULT_CLAUDE_MODEL || DEFAULT_CLAUDE_MODEL),
+    },
     routes: {
       raw: `${origin}/api/chat, /api/search, /api/merge, /api/models, /api/key, /api/attachments/extract`,
       openai: `${origin}/v1/chat/completions, /v1/responses, /v1/models, /v1/files`,
