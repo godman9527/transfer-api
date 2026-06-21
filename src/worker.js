@@ -53,10 +53,21 @@ export default {
 
       return errorResponse(404, "not_found", `No route for ${path}`);
     } catch (error) {
+      if (error instanceof UpstreamError) {
+        return upstreamErrorResponse(error);
+      }
       return errorResponse(500, "internal_error", error && error.message ? error.message : String(error));
     }
   },
 };
+
+class UpstreamError extends Error {
+  constructor(status, detail) {
+    super(detail);
+    this.status = status || 502;
+    this.detail = detail || "";
+  }
+}
 
 async function handleOpenAI(request, env, path) {
   if ((path === "/v1/key" || path === "/v1/auth-key" || path === "/v1/usage") && request.method === "GET") {
@@ -330,8 +341,7 @@ async function upstreamAnthropicMessages(request, env, body) {
   });
 
   if (!response.ok) {
-    const detail = await response.text();
-    throw new Error(`upstream /v1/messages failed: ${response.status} ${detail}`);
+    return addCors(response);
   }
 
   return addCors(response);
@@ -778,7 +788,8 @@ async function callAnthropicMessagesJson(request, env, body) {
   });
 
   if (!response.ok) {
-    throw new Error(`upstream /v1/messages failed: ${response.status} ${await response.text()}`);
+    const detail = await response.text();
+    throw new UpstreamError(response.status, detail || response.statusText);
   }
 
   return response.json();
@@ -1515,6 +1526,19 @@ function errorResponse(status, code, message) {
       code,
     },
   }, { status });
+}
+
+function upstreamErrorResponse(error) {
+  const status = error.status || 502;
+  const detail = String(error.detail || "");
+  const parsed = parseSseJson(detail);
+  if (parsed) return jsonResponse(parsed, { status });
+
+  try {
+    return jsonResponse(JSON.parse(detail), { status });
+  } catch (_) {
+    return errorResponse(status, "upstream_error", detail || `Upstream request failed with status ${status}.`);
+  }
 }
 
 function addCors(response) {
