@@ -28,7 +28,7 @@ export default {
       }
 
       if (path.startsWith("/api/")) {
-        return proxyUpstream(request, env, path);
+        return await proxyUpstream(request, env, path);
       }
 
       if (path === "/mcp" || path === "/v1/mcp" || path === "/anthropic/mcp" || path === "/anthropic/v1/mcp") {
@@ -44,11 +44,11 @@ export default {
       }
 
       if (path === "/v1/messages" || (path === "/v1/models" && looksLikeAnthropicRequest(request)) || path.startsWith("/anthropic/")) {
-        return handleAnthropic(request, env, path);
+        return await handleAnthropic(request, env, path);
       }
 
       if (path.startsWith("/v1/")) {
-        return handleOpenAI(request, env, path);
+        return await handleOpenAI(request, env, path);
       }
 
       return errorResponse(404, "not_found", `No route for ${path}`);
@@ -1585,10 +1585,22 @@ function upstreamApiKey(request, env) {
   if (key) return key;
 
   if (env.WORKER_API_KEY) {
-    throw new Error("Missing upstream API key. Set UNLIMITED_SURF_API_KEY when WORKER_API_KEY is enabled.");
+    throw new UpstreamError(500, JSON.stringify({
+      error: {
+        message: "Missing upstream API key. Set UNLIMITED_SURF_API_KEY in the active Cloudflare Worker environment.",
+        type: "configuration_error",
+        code: "missing_upstream_api_key",
+      },
+    }));
   }
 
-  throw new Error("Missing upstream API key. Set UNLIMITED_SURF_API_KEY or pass Authorization: Bearer <key> / x-api-key: <key>.");
+  throw new UpstreamError(500, JSON.stringify({
+    error: {
+      message: "Missing upstream API key. Set UNLIMITED_SURF_API_KEY or pass Authorization: Bearer <key> / x-api-key: <key>.",
+      type: "configuration_error",
+      code: "missing_upstream_api_key",
+    },
+  }));
 }
 
 function optionalUpstreamApiKey(request, env) {
