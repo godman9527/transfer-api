@@ -237,9 +237,55 @@ This is a Cloudflare Worker adapter for `https://unlimited.surf`. It exposes Ope
 - Web Search maps to upstream `POST /api/search`.
 - Merge AI maps to upstream `POST /api/merge`.
 - Files extraction maps to upstream `POST /api/attachments/extract`.
+- Native Anthropic tool-use proxy plus OpenAI-to-Anthropic tool bridge for agent clients.
 - Agent Setup, Codex, and MCP info endpoints are available at `/v1/setup`, `/v1/codex`, and `/v1/mcp`.
 
 MCP servers still run inside your local agent, IDE, Claude Code, or Codex environment. This Worker only provides the model API endpoint and does not read or modify local files from Cloudflare.
+
+## Agent tool calling
+
+This fork includes agent-oriented handling for clients such as Codex, Claude Code, IDE agents, and MCP-enabled local runtimes.
+
+The Worker still does not execute tools at the edge. Local tools are executed by Codex, Claude Code, your IDE, or MCP servers. The Worker makes sure those clients receive real tool-call protocol messages instead of plain text.
+
+The preferred path is Anthropic-compatible `/v1/messages`: unlimited.surf exposes this endpoint directly, and this Worker forwards Anthropic Messages requests to the upstream endpoint so native `tool_use` blocks survive the proxy.
+
+For OpenAI-compatible routes, unlimited.surf does not expose native `/v1/chat/completions` or `/v1/responses` upstream endpoints. When an OpenAI-compatible request includes `tools`, this Worker bridges the request to upstream Anthropic `/v1/messages`, preserves tool execution loops, and converts the result back into the OpenAI protocol:
+
+- OpenAI Chat Completions: `message.tool_calls` with `finish_reason: "tool_calls"`, and later `tool` messages are converted back to Anthropic `tool_result`.
+- OpenAI Responses: `output` items with `type: "function_call"`, and later `function_call_output` items are converted back to Anthropic `tool_result`.
+- Anthropic Messages: `content` blocks with `type: "tool_use"` and `stop_reason: "tool_use"`.
+
+For Claude Code and other Anthropic-compatible clients, use `/v1/messages` and let the upstream return native `tool_use`. For OpenAI-compatible clients, tool-enabled requests are internally routed through the Anthropic tool bridge. Non-tool OpenAI-compatible chat still uses the original `/api/chat` mapping.
+
+OpenAI Chat Completions smoke test:
+
+```bash
+curl https://<your-worker>.workers.dev/v1/chat/completions \
+  -H "Authorization: Bearer <your WORKER_API_KEY>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gateway-gpt-5",
+    "stream": false,
+    "messages": [{"role": "user", "content": "Create a folder named 159 on my desktop."}],
+    "tools": [{
+      "type": "function",
+      "function": {
+        "name": "create_folder",
+        "description": "Create a folder on the local machine.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "path": {"type": "string"}
+          },
+          "required": ["path"]
+        }
+      }
+    }]
+  }'
+```
+
+The expected response is a tool call, not the folder itself being created. Your local agent or MCP tool runtime must receive and execute the call.
 
 ## Deploy from GitHub with Cloudflare
 
@@ -441,6 +487,7 @@ claude
 - Merge AI maps to upstream `POST /api/merge` when you call `/v1/merge`, pass `merge: true`, or pass `models` with 2+ model IDs.
 - Models maps to upstream `GET /api/models` with a fallback catalog if the upstream call fails.
 - Files maps upload/extract requests to upstream `POST /api/attachments/extract`; persistent file storage requires adding KV or R2.
+- Tool calls are adapted for non-streaming OpenAI Chat Completions, OpenAI Responses, and Anthropic Messages requests when the upstream model follows the JSON tool-call instruction.
 - Codex, Agent Setup, and MCP are setup/info endpoints. MCP tool execution remains local to the client agent or IDE.
 - Embeddings, audio, and images return `501` because the provided unlimited.surf docs do not expose those native APIs.
 
